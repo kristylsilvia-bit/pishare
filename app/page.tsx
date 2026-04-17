@@ -57,10 +57,30 @@ export default function Home() {
   const onDragOver = (e: React.DragEvent) => { e.preventDefault(); setDragging(true); };
   const onDragLeave = () => setDragging(false);
 
-  const doUpload = () => {
+  const doUpload = async () => {
     if (!file) return;
     setState('uploading');
     setProgress(0);
+
+    // Step 1 — get a short-lived upload token from Vercel (keeps API key server-side)
+    let token: string;
+    try {
+      const res = await fetch('/api/upload-token');
+      if (!res.ok) throw new Error('Could not get upload token');
+      ({ token } = await res.json());
+    } catch {
+      setError('Could not reach the server. Try again.');
+      setState('error');
+      return;
+    }
+
+    // Step 2 — upload directly to the Pi (no Vercel size limit!)
+    const piUrl = process.env.NEXT_PUBLIC_PI_SERVER_URL;
+    if (!piUrl) {
+      setError('NEXT_PUBLIC_PI_SERVER_URL is not set in Vercel env vars.');
+      setState('error');
+      return;
+    }
 
     const fd = new FormData();
     fd.append('file', file);
@@ -88,11 +108,12 @@ export default function Home() {
     });
 
     xhr.addEventListener('error', () => {
-      setError('Network error — make sure your Pi server is reachable.');
+      setError('Network error — make sure your Pi is reachable.');
       setState('error');
     });
 
-    xhr.open('POST', '/api/upload');
+    xhr.open('POST', `${piUrl}/upload`);
+    xhr.setRequestHeader('X-Upload-Token', token);
     xhr.send(fd);
   };
 
