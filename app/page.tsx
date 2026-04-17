@@ -74,7 +74,6 @@ export default function Home() {
       return;
     }
 
-    // Step 2 — upload directly to the Pi (no Vercel size limit!)
     const piUrl = process.env.NEXT_PUBLIC_PI_SERVER_URL;
     if (!piUrl) {
       setError('NEXT_PUBLIC_PI_SERVER_URL is not set in Vercel env vars.');
@@ -82,39 +81,47 @@ export default function Home() {
       return;
     }
 
-    const fd = new FormData();
-    fd.append('file', file);
+    // Step 2 — chunked upload directly to Pi (50 MB chunks bypass Cloudflare's 100 MB limit)
+    const CHUNK_SIZE = 50 * 1024 * 1024; // 50 MB per chunk
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const uploadId = crypto.randomUUID();
 
-    const xhr = new XMLHttpRequest();
+    try {
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const chunk = file.slice(start, start + CHUNK_SIZE);
 
-    xhr.upload.addEventListener('progress', e => {
-      if (e.lengthComputable) setProgress(Math.round((e.loaded / e.total) * 100));
-    });
+        const fd = new FormData();
+        fd.append('chunk', chunk, file.name);
+        fd.append('uploadId', uploadId);
+        fd.append('chunkIndex', String(i));
+        fd.append('totalChunks', String(totalChunks));
+        fd.append('fileName', file.name);
+        fd.append('fileSize', String(file.size));
+        fd.append('mimeType', file.type || 'application/octet-stream');
 
-    xhr.addEventListener('load', () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          const data = JSON.parse(xhr.responseText);
+        const res = await fetch(`${piUrl}/upload/chunk`, {
+          method: 'POST',
+          headers: { 'X-Upload-Token': token },
+          body: fd,
+        });
+
+        if (!res.ok) throw new Error(`Chunk ${i + 1} failed (${res.status})`);
+
+        const data = await res.json();
+        setProgress(Math.round(((i + 1) / totalChunks) * 100));
+
+        if (data.done) {
           setShareUrl(`${window.location.origin}/f/${data.id}`);
           setState('done');
-        } catch {
-          setError('Server returned unexpected response.');
-          setState('error');
+          return;
         }
-      } else {
-        setError(`Upload failed (${xhr.status}). Check your Pi server is running.`);
-        setState('error');
       }
-    });
-
-    xhr.addEventListener('error', () => {
-      setError('Network error — make sure your Pi is reachable.');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      setError(`Upload failed: ${msg}`);
       setState('error');
-    });
-
-    xhr.open('POST', `${piUrl}/upload`);
-    xhr.setRequestHeader('X-Upload-Token', token);
-    xhr.send(fd);
+    }
   };
 
   const copyLink = async () => {
