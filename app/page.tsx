@@ -62,27 +62,9 @@ export default function Home() {
     setState('uploading');
     setProgress(0);
 
-    // Step 1 — get a short-lived upload token from Vercel (keeps API key server-side)
-    let token: string;
-    try {
-      const res = await fetch('/api/upload-token');
-      if (!res.ok) throw new Error('Could not get upload token');
-      ({ token } = await res.json());
-    } catch {
-      setError('Could not reach the server. Try again.');
-      setState('error');
-      return;
-    }
-
-    const piUrl = process.env.NEXT_PUBLIC_PI_SERVER_URL;
-    if (!piUrl) {
-      setError('NEXT_PUBLIC_PI_SERVER_URL is not set in Vercel env vars.');
-      setState('error');
-      return;
-    }
-
-    // Step 2 — chunked upload directly to Pi (50 MB chunks bypass Cloudflare's 100 MB limit)
-    const CHUNK_SIZE = 50 * 1024 * 1024; // 50 MB per chunk
+    // Chunked upload through Vercel API (avoids mixed content + size limits)
+    // Each chunk goes: browser → Vercel (HTTPS) → Pi. No HTTPS needed on Pi.
+    const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB chunks — safely under Vercel's limit
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     const uploadId = crypto.randomUUID();
 
@@ -100,9 +82,8 @@ export default function Home() {
         fd.append('fileSize', String(file.size));
         fd.append('mimeType', file.type || 'application/octet-stream');
 
-        const res = await fetch(`${piUrl}/upload/chunk`, {
+        const res = await fetch('/api/upload', {
           method: 'POST',
-          headers: { 'X-Upload-Token': token },
           body: fd,
         });
 

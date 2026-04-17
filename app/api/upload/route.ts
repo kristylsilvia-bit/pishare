@@ -1,11 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
-export const maxDuration = 300; // 5 min max for large uploads
+export const maxDuration = 300;
 
 const PI_SERVER_URL = process.env.PI_SERVER_URL;
 const PI_API_KEY = process.env.PI_API_KEY;
 
+// Forwards each chunk from the browser to the Pi server.
+// Browser → Vercel (HTTPS) → Pi (HTTP on local network via port forwarding).
+// Each chunk is 4 MB so it stays well under Vercel's body size limit.
 export async function POST(request: NextRequest) {
   if (!PI_SERVER_URL || !PI_API_KEY) {
     return NextResponse.json(
@@ -14,20 +17,16 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // Stream the multipart body directly to the Pi instead of buffering it.
-  // This lets you upload large files without hitting Vercel's memory limit.
   const contentType = request.headers.get('content-type');
-  const contentLength = request.headers.get('content-length');
 
   try {
-    const piRes = await fetch(`${PI_SERVER_URL}/upload`, {
+    const piRes = await fetch(`${PI_SERVER_URL}/upload/chunk`, {
       method: 'POST',
       headers: {
         'X-API-Key': PI_API_KEY,
-        ...(contentType   && { 'Content-Type': contentType }),
-        ...(contentLength && { 'Content-Length': contentLength }),
+        ...(contentType && { 'Content-Type': contentType }),
       },
-      // @ts-ignore — duplex is required in Node 18+ for streaming request bodies
+      // @ts-ignore
       duplex: 'half',
       body: request.body,
     });
@@ -35,10 +34,7 @@ export async function POST(request: NextRequest) {
     if (!piRes.ok) {
       const msg = await piRes.text().catch(() => 'Unknown error');
       console.error('[upload] Pi error:', piRes.status, msg);
-      return NextResponse.json(
-        { error: `Pi server returned ${piRes.status}` },
-        { status: 502 }
-      );
+      return NextResponse.json({ error: `Pi server returned ${piRes.status}` }, { status: 502 });
     }
 
     const data = await piRes.json();
@@ -46,7 +42,7 @@ export async function POST(request: NextRequest) {
   } catch (err) {
     console.error('[upload] fetch error:', err);
     return NextResponse.json(
-      { error: 'Could not reach Pi server — is it running and port-forwarded?' },
+      { error: 'Could not reach Pi server — is it running?' },
       { status: 503 }
     );
   }
