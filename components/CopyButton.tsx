@@ -1,31 +1,38 @@
 'use client';
 
 import { useState } from 'react';
-import { Copy, Check, Link } from 'lucide-react';
+import { Copy, Check } from 'lucide-react';
 
-export default function CopyButton() {
+export function CopyButton({
+  text,
+  className = '',
+  label,
+}: {
+  text: string;
+  className?: string;
+  label?: string;
+}) {
   const [copied, setCopied] = useState(false);
 
-  const handleCopy = async () => {
-    await navigator.clipboard.writeText(window.location.href);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2500);
-  };
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    } catch {
+      /* clipboard unavailable (e.g. insecure context) — fail quietly */
+    }
+  }
 
   return (
     <button
-      onClick={handleCopy}
-      className={`w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 ${
-        copied
-          ? 'bg-emerald-600/20 text-emerald-400 border border-emerald-600/30'
-          : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/50'
-      }`}
+      type="button"
+      onClick={copy}
+      title={copied ? 'Copied!' : 'Copy'}
+      className={`copy-btn ${className}`}
     >
-      {copied ? (
-        <><Check size={14} /> Link copied!</>
-      ) : (
-        <><Link size={14} /> Copy share link</>
-      )}
+      {copied ? <Check size={14} /> : <Copy size={14} />}
+      {label && <span>{copied ? 'Copied' : label}</span>}
     </button>
   );
 }

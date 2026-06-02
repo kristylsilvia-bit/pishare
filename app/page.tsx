@@ -1,328 +1,342 @@
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
-import { Upload, Copy, Check, X, HardDrive, Zap } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowDown, Sparkles, Terminal, Brain, CalendarClock } from 'lucide-react';
+import { Toolbar } from '@/components/Toolbar';
+import { ChatMessage } from '@/components/ChatMessage';
+import { ChatInput } from '@/components/ChatInput';
+import { SettingsSidebar } from '@/components/SettingsSidebar';
+import { OfflineBanner } from '@/components/OfflineBanner';
+import { DEFAULT_SETTINGS, type Message, type Settings, type HealthStatus } from '@/lib/types';
+import { estimateConversationTokens, estimateTokens } from '@/lib/tokens';
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+const HELP_TEXT = `**Slash commands**
+
+- \`/model\` — open settings and switch the active model
+- \`/clear\` — clear the conversation
+- \`/memory\` — inspect the agent's memory _(sent to Hermes)_
+- \`/skills\` — list the agent's skills _(sent to Hermes)_
+- \`/cron\` — show scheduled tasks _(sent to Hermes)_
+- \`/help\` — show this help
+
+Type \`/\` in the message box to see them inline.`;
+
+const SUGGESTIONS = [
+  { icon: Brain, label: 'What do you remember about me?', text: '/memory' },
+  { icon: Terminal, label: 'What skills do you have?', text: '/skills' },
+  { icon: CalendarClock, label: 'Show my scheduled tasks', text: '/cron' },
+];
+
+function uid() {
+  return typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2);
 }
 
-function getFileEmoji(mime: string): string {
-  if (mime.startsWith('image/'))  return '🖼️';
-  if (mime.startsWith('video/'))  return '🎬';
-  if (mime.startsWith('audio/'))  return '🎵';
-  if (mime.includes('pdf'))       return '📄';
-  if (mime.includes('zip') || mime.includes('rar') || mime.includes('7z') || mime.includes('tar')) return '🗜️';
-  if (mime.includes('text') || mime.includes('json') || mime.includes('xml')) return '📝';
-  if (mime.includes('spreadsheet') || mime.includes('excel')) return '📊';
-  if (mime.includes('presentation') || mime.includes('powerpoint')) return '📊';
-  if (mime.includes('word') || mime.includes('document')) return '📝';
-  return '📁';
-}
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-type State = 'idle' | 'selected' | 'uploading' | 'done' | 'error';
-
-// ─── Component ────────────────────────────────────────────────────────────────
 export default function Home() {
-  const [state, setState] = useState<State>('idle');
-  const [file, setFile] = useState<File | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [shareUrl, setShareUrl] = useState('');
-  const [error, setError] = useState('');
-  const [copied, setCopied] = useState(false);
-  const [dragging, setDragging] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [modelFocusSignal, setModelFocusSignal] = useState(0);
+  const [health, setHealth] = useState<HealthStatus>('checking');
+  const [offline, setOffline] = useState(false);
+  const [streaming, setStreaming] = useState(false);
+  const [showJump, setShowJump] = useState(false);
 
-  const pickFile = useCallback((f: File) => {
-    setFile(f);
-    setState('selected');
-    setError('');
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const autoScroll = useRef(true);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // ── Health polling ──────────────────────────────────────────────────────
+  const checkHealth = useCallback(async (initial = false) => {
+    if (initial) setHealth('checking');
+    try {
+      const res = await fetch('/api/health', { cache: 'no-store' });
+      const data = await res.json();
+      if (data.ok) {
+        setHealth('online');
+        setOffline(false);
+      } else {
+        setHealth('offline');
+        if (initial) setOffline(true);
+      }
+    } catch {
+      setHealth('offline');
+      if (initial) setOffline(true);
+    }
   }, []);
 
-  const onDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setDragging(false);
-      const f = e.dataTransfer.files[0];
-      if (f) pickFile(f);
-    },
-    [pickFile]
-  );
+  useEffect(() => {
+    checkHealth(true);
+    const id = setInterval(() => checkHealth(false), 30_000);
+    return () => clearInterval(id);
+  }, [checkHealth]);
 
-  const onDragOver = (e: React.DragEvent) => { e.preventDefault(); setDragging(true); };
-  const onDragLeave = () => setDragging(false);
+  // ── Auto-scroll (pauses when the user scrolls up) ─────────────────────────
+  useEffect(() => {
+    if (autoScroll.current && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages]);
 
-  const doUpload = async () => {
-    if (!file) return;
-    setState('uploading');
-    setProgress(0);
+  function onScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    autoScroll.current = nearBottom;
+    setShowJump(!nearBottom && messages.length > 0);
+  }
 
-    // Chunked upload through Vercel API (avoids mixed content + size limits)
-    // Each chunk goes: browser → Vercel (HTTPS) → Pi. No HTTPS needed on Pi.
-    const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB chunks — safely under Vercel's limit
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    const uploadId = crypto.randomUUID();
+  function jumpToBottom() {
+    const el = scrollRef.current;
+    if (!el) return;
+    autoScroll.current = true;
+    el.scrollTop = el.scrollHeight;
+    setShowJump(false);
+  }
+
+  // ── Message helpers ───────────────────────────────────────────────────────
+  function patchMessage(id: string, content: string) {
+    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, content } : m)));
+  }
+
+  function updateSettings(patch: Partial<Settings>) {
+    setSettings((s) => ({ ...s, ...patch }));
+  }
+
+  function newChat() {
+    abortRef.current?.abort();
+    setMessages([]);
+    autoScroll.current = true;
+    setShowJump(false);
+  }
+
+  function exportMarkdown() {
+    if (messages.length === 0) return;
+    const head = `# Hermes conversation\n\n- **Model:** ${settings.model}\n- **Exported:** ${new Date().toISOString()}\n\n---\n\n`;
+    const body = messages
+      .map((m) => {
+        const who = m.role === 'user' ? 'You' : m.role === 'assistant' ? 'Hermes' : 'System';
+        return `### ${who}\n\n${m.content}\n`;
+      })
+      .join('\n---\n\n');
+    const blob = new Blob([head + body], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `hermes-chat-${Date.now()}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // ── Streaming send ────────────────────────────────────────────────────────
+  async function sendToAgent(text: string) {
+    const userMsg: Message = { id: uid(), role: 'user', content: text, createdAt: Date.now() };
+    const assistantId = uid();
+    const history = [...messages, userMsg];
+
+    setMessages([
+      ...history,
+      { id: assistantId, role: 'assistant', content: '', createdAt: Date.now() },
+    ]);
+    setStreaming(true);
+    autoScroll.current = true;
+
+    const apiMessages: { role: string; content: string }[] = [];
+    if (settings.systemPrompt.trim()) {
+      apiMessages.push({ role: 'system', content: settings.systemPrompt });
+    }
+    for (const m of history) apiMessages.push({ role: m.role, content: m.content });
+
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     try {
-      for (let i = 0; i < totalChunks; i++) {
-        const start = i * CHUNK_SIZE;
-        const chunk = file.slice(start, start + CHUNK_SIZE);
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: settings.model,
+          messages: apiMessages,
+          temperature: settings.temperature,
+          max_tokens: settings.maxTokens,
+          top_p: settings.topP,
+          frequency_penalty: settings.frequencyPenalty,
+          presence_penalty: settings.presencePenalty,
+          stream: true,
+        }),
+      });
 
-        const fd = new FormData();
-        fd.append('chunk', chunk, file.name);
-        fd.append('uploadId', uploadId);
-        fd.append('chunkIndex', String(i));
-        fd.append('totalChunks', String(totalChunks));
-        fd.append('fileName', file.name);
-        fd.append('fileSize', String(file.size));
-        fd.append('mimeType', file.type || 'application/octet-stream');
+      if (!res.ok || !res.body) {
+        let msg = 'Request failed.';
+        try {
+          const j = await res.json();
+          msg = j.error || msg;
+        } catch {
+          /* non-JSON error body */
+        }
+        patchMessage(assistantId, `⚠️ ${msg}`);
+        return;
+      }
 
-        const res = await fetch('/api/upload', {
-          method: 'POST',
-          body: fd,
-        });
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let acc = '';
 
-        if (!res.ok) throw new Error(`Chunk ${i + 1} failed (${res.status})`);
-
-        const data = await res.json();
-        setProgress(Math.round(((i + 1) / totalChunks) * 100));
-
-        if (data.done) {
-          setShareUrl(`${window.location.origin}/f/${data.id}`);
-          setState('done');
-          return;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          const s = line.trim();
+          if (!s.startsWith('data:')) continue;
+          const payload = s.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const json = JSON.parse(payload);
+            const delta: string = json.choices?.[0]?.delta?.content ?? '';
+            if (delta) {
+              acc += delta;
+              patchMessage(assistantId, acc);
+            }
+          } catch {
+            /* keep-alive or partial chunk — ignore */
+          }
         }
       }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Unknown error';
-      setError(`Upload failed: ${msg}`);
-      setState('error');
+
+      if (!acc) patchMessage(assistantId, '_(no content returned)_');
+    } catch (err) {
+      const name = (err as { name?: string })?.name;
+      if (name === 'AbortError') {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId && !m.content ? { ...m, content: '_(stopped)_' } : m,
+          ),
+        );
+      } else {
+        patchMessage(assistantId, '⚠️ Could not reach Hermes. Check the connection.');
+      }
+    } finally {
+      setStreaming(false);
+      abortRef.current = null;
     }
-  };
+  }
 
-  const copyLink = async () => {
-    await navigator.clipboard.writeText(shareUrl);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2500);
-  };
+  // ── Submit routing (UI commands vs. agent) ────────────────────────────────
+  function handleSubmit(text: string) {
+    const t = text.trim();
 
-  const reset = () => {
-    setState('idle');
-    setFile(null);
-    setProgress(0);
-    setShareUrl('');
-    setError('');
-    setCopied(false);
-    if (inputRef.current) inputRef.current.value = '';
-  };
+    if (t === '/clear') {
+      newChat();
+      return;
+    }
+    if (t === '/model' || t.startsWith('/model ')) {
+      setSidebarOpen(true);
+      setModelFocusSignal((n) => n + 1);
+      return;
+    }
+    if (t === '/help' || t.startsWith('/help')) {
+      setMessages((prev) => [
+        ...prev,
+        { id: uid(), role: 'assistant', content: HELP_TEXT, createdAt: Date.now() },
+      ]);
+      autoScroll.current = true;
+      return;
+    }
+
+    // Everything else (including /memory, /skills, /cron) goes to the agent.
+    sendToAgent(t);
+  }
+
+  const tokenEstimate =
+    estimateConversationTokens(messages) + estimateTokens(settings.systemPrompt);
 
   return (
-    <main className="min-h-screen bg-[#080c14] text-white flex flex-col">
-      {/* ── Nav ── */}
-      <nav className="border-b border-slate-800/60 px-6 py-4">
-        <div className="max-w-5xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-lg shadow-blue-900/40">
-              <HardDrive size={15} className="text-white" />
+    <div className="app">
+      {offline && <OfflineBanner onRetry={() => checkHealth(true)} />}
+
+      <Toolbar
+        status={health}
+        model={settings.model}
+        onNewChat={newChat}
+        onClear={newChat}
+        onExport={exportMarkdown}
+        onToggleSidebar={() => setSidebarOpen((v) => !v)}
+      />
+
+      <main className="chat" ref={scrollRef} onScroll={onScroll}>
+        <div className="chat__inner">
+          {messages.length === 0 ? (
+            <div className="empty">
+              <div className="empty__badge">
+                <Sparkles size={26} />
+              </div>
+              <h1 className="empty__title">Talk to Hermes</h1>
+              <p className="empty__sub">
+                Your agent, wired up. Stream a chat, tweak params, or edit its config —
+                all from here.
+              </p>
+              <div className="empty__suggestions">
+                {SUGGESTIONS.map(({ icon: Icon, label, text }) => (
+                  <button
+                    key={text}
+                    type="button"
+                    className="suggestion glass"
+                    onClick={() => handleSubmit(text)}
+                  >
+                    <Icon size={16} />
+                    <span>{label}</span>
+                  </button>
+                ))}
+              </div>
             </div>
-            <span className="font-bold text-lg tracking-tight">PiShare</span>
-          </div>
-          <span className="text-xs text-slate-500 flex items-center gap-1.5">
-            <Zap size={11} className="text-blue-400" />
-            Powered by your Pi
+          ) : (
+            messages.map((m, i) => (
+              <ChatMessage
+                key={m.id}
+                message={m}
+                streaming={
+                  streaming && i === messages.length - 1 && m.role === 'assistant'
+                }
+              />
+            ))
+          )}
+        </div>
+      </main>
+
+      {showJump && (
+        <button type="button" className="jump" onClick={jumpToBottom} title="Jump to latest">
+          <ArrowDown size={18} />
+        </button>
+      )}
+
+      <footer className="footer">
+        <ChatInput
+          onSubmit={handleSubmit}
+          streaming={streaming}
+          onStop={() => abortRef.current?.abort()}
+        />
+        <div className="footer__meta">
+          <span>
+            ~{tokenEstimate.toLocaleString()} tokens · {messages.length} message
+            {messages.length === 1 ? '' : 's'}
           </span>
+          <span className="footer__hint">Enter to send · Shift+Enter for newline</span>
         </div>
-      </nav>
+      </footer>
 
-      {/* ── Hero ── */}
-      <div className="flex-1 flex flex-col items-center justify-center px-4 py-16">
-        <div className="w-full max-w-lg">
-          {/* Tagline */}
-          <div className="text-center mb-10">
-            <h1 className="text-4xl font-extrabold tracking-tight mb-3 bg-gradient-to-br from-white via-slate-200 to-slate-400 bg-clip-text text-transparent">
-              Share files instantly
-            </h1>
-            <p className="text-slate-400">
-              Drop a file — get a link. Stored on your own hardware.
-            </p>
-          </div>
-
-          {/* ── Card ── */}
-          <div className="bg-slate-900/70 border border-slate-800/80 rounded-2xl overflow-hidden shadow-2xl shadow-black/50 backdrop-blur-sm">
-
-            {/* IDLE — Drop zone */}
-            {state === 'idle' && (
-              <div
-                className={`relative p-12 flex flex-col items-center gap-5 cursor-pointer transition-all duration-200 ${
-                  dragging
-                    ? 'bg-blue-950/60'
-                    : 'hover:bg-slate-800/30'
-                }`}
-                onDrop={onDrop}
-                onDragOver={onDragOver}
-                onDragLeave={onDragLeave}
-                onClick={() => inputRef.current?.click()}
-              >
-                {/* Border glow when dragging */}
-                {dragging && (
-                  <div className="absolute inset-0 border-2 border-blue-500 rounded-2xl pointer-events-none drop-ring" />
-                )}
-
-                <div className={`w-20 h-20 rounded-2xl flex items-center justify-center transition-all duration-200 ${
-                  dragging ? 'bg-blue-500 scale-110' : 'bg-slate-800'
-                }`}>
-                  <Upload size={30} className={dragging ? 'text-white' : 'text-slate-400'} />
-                </div>
-
-                <div className="text-center">
-                  <p className="font-semibold text-lg text-slate-100">
-                    {dragging ? 'Drop it!' : 'Drop file here or click to browse'}
-                  </p>
-                  <p className="text-slate-500 text-sm mt-1">Any file type · No size limit</p>
-                </div>
-
-                <input
-                  ref={inputRef}
-                  type="file"
-                  className="hidden"
-                  onChange={e => { const f = e.target.files?.[0]; if (f) pickFile(f); }}
-                />
-              </div>
-            )}
-
-            {/* SELECTED — Ready to upload */}
-            {state === 'selected' && file && (
-              <div className="p-8">
-                <div className="flex items-start gap-4 p-4 bg-slate-800/60 rounded-xl border border-slate-700/50 mb-6">
-                  <span className="text-3xl select-none">{getFileEmoji(file.type)}</span>
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium truncate text-slate-100">{file.name}</p>
-                    <p className="text-slate-400 text-sm mt-0.5">{formatBytes(file.size)}</p>
-                  </div>
-                  <button
-                    onClick={reset}
-                    className="text-slate-500 hover:text-slate-300 transition-colors mt-0.5"
-                  >
-                    <X size={18} />
-                  </button>
-                </div>
-
-                <button
-                  onClick={doUpload}
-                  className="w-full py-3.5 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 rounded-xl font-semibold transition-all duration-150 shadow-lg shadow-blue-900/30"
-                >
-                  Upload &amp; Get Link
-                </button>
-
-                <button onClick={reset} className="w-full mt-3 py-2 text-slate-500 hover:text-slate-300 text-sm transition-colors">
-                  Choose different file
-                </button>
-              </div>
-            )}
-
-            {/* UPLOADING — Progress */}
-            {state === 'uploading' && file && (
-              <div className="p-8">
-                <div className="flex items-center gap-3 mb-6">
-                  <span className="text-2xl">{getFileEmoji(file.type)}</span>
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium text-sm truncate text-slate-200">{file.name}</p>
-                    <p className="text-slate-500 text-xs mt-0.5">{formatBytes(file.size)}</p>
-                  </div>
-                  <span className="text-blue-400 font-semibold text-sm tabular-nums">{progress}%</span>
-                </div>
-
-                {/* Progress bar */}
-                <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden mb-3">
-                  <div
-                    className="h-full bg-gradient-to-r from-blue-600 to-blue-400 rounded-full transition-all duration-200"
-                    style={{ width: `${progress}%` }}
-                  />
-                </div>
-
-                <p className="text-slate-500 text-sm text-center">
-                  Uploading to your Pi… {progress < 100 ? '' : 'Processing…'}
-                </p>
-              </div>
-            )}
-
-            {/* DONE — Share link */}
-            {state === 'done' && (
-              <div className="p-8">
-                {/* Success badge */}
-                <div className="flex flex-col items-center gap-3 mb-7">
-                  <div className="w-14 h-14 bg-emerald-500/20 rounded-full flex items-center justify-center ring-4 ring-emerald-500/10">
-                    <Check size={26} className="text-emerald-400" />
-                  </div>
-                  <div className="text-center">
-                    <p className="font-bold text-lg">Uploaded!</p>
-                    <p className="text-slate-400 text-sm mt-0.5">Your file is ready to share</p>
-                  </div>
-                </div>
-
-                {/* Link row */}
-                <div className="flex gap-2 mb-5">
-                  <input
-                    type="text"
-                    readOnly
-                    value={shareUrl}
-                    onClick={e => (e.target as HTMLInputElement).select()}
-                    className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-slate-300 focus:outline-none focus:border-blue-500 transition-colors cursor-text"
-                  />
-                  <button
-                    onClick={copyLink}
-                    className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 ${
-                      copied
-                        ? 'bg-emerald-600 text-white'
-                        : 'bg-blue-600 hover:bg-blue-500 text-white'
-                    }`}
-                  >
-                    {copied ? <><Check size={14} /> Copied!</> : <><Copy size={14} /> Copy</>}
-                  </button>
-                </div>
-
-                <button
-                  onClick={reset}
-                  className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 rounded-xl text-sm font-medium text-slate-300 transition-colors"
-                >
-                  Upload another file
-                </button>
-              </div>
-            )}
-
-            {/* ERROR */}
-            {state === 'error' && (
-              <div className="p-8">
-                <div className="flex flex-col items-center gap-3 mb-7">
-                  <div className="w-14 h-14 bg-red-500/20 rounded-full flex items-center justify-center ring-4 ring-red-500/10">
-                    <X size={26} className="text-red-400" />
-                  </div>
-                  <div className="text-center">
-                    <p className="font-bold text-lg">Upload failed</p>
-                    <p className="text-slate-400 text-sm mt-1 max-w-xs mx-auto">{error}</p>
-                  </div>
-                </div>
-                <button
-                  onClick={reset}
-                  className="w-full py-3 bg-slate-800 hover:bg-slate-700 rounded-xl font-medium transition-colors"
-                >
-                  Try again
-                </button>
-              </div>
-            )}
-          </div>
-
-          <p className="text-center text-slate-600 text-xs mt-5 flex items-center justify-center gap-1.5">
-            <HardDrive size={11} />
-            Files stored on your personal Raspberry Pi
-          </p>
-        </div>
-      </div>
-    </main>
+      <SettingsSidebar
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        settings={settings}
+        onChange={updateSettings}
+        modelFocusSignal={modelFocusSignal}
+      />
+    </div>
   );
 }

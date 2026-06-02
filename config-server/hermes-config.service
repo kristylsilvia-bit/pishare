@@ -1,0 +1,18 @@
+[Unit]
+Description=Hermes Config Server (serves ~/.hermes/config.yaml to the Hermes Web UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and the paths below to match your Pi (whoami / pwd).
+User=pi
+WorkingDirectory=/home/pi/hermes-web-ui/config-server
+ExecStart=/home/pi/hermes-web-ui/config-server/start.sh
+EnvironmentFile=/home/pi/hermes-web-ui/config-server/.env
+Environment=NODE_ENV=production
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
