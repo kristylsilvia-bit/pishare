@@ -19,11 +19,11 @@ export async function GET() {
       body = null;
     }
 
-    return Response.json(
-      { ok: res.ok, status: res.status, body },
-      { status: res.ok ? 200 : 502 },
-    );
+    // Always answer 200 — this endpoint is polled every 30s, so returning a
+    // non-2xx for an unreachable agent just spams the browser console. The
+    // actual reachability is carried in `ok` and read by the client.
+    return Response.json({ ok: res.ok, status: res.status, body });
   } catch {
-    return Response.json({ ok: false, status: 0 }, { status: 502 });
+    return Response.json({ ok: false, status: 0 });
   }
 }
