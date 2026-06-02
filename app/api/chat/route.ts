@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { HERMES_API_URL } from '@/lib/env';
+import { HERMES_API_URL, hermesAuthHeaders } from '@/lib/env';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -15,7 +15,7 @@ export async function POST(req: NextRequest) {
   try {
     upstream = await fetch(`${HERMES_API_URL}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...hermesAuthHeaders() },
       body,
       // @ts-expect-error — Node fetch streaming bodies require this flag.
       duplex: 'half',

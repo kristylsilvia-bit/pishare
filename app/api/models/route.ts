@@ -1,4 +1,4 @@
-import { HERMES_API_URL } from '@/lib/env';
+import { HERMES_API_URL, hermesAuthHeaders } from '@/lib/env';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -8,6 +8,7 @@ export const dynamic = 'force-dynamic';
 export async function GET() {
   try {
     const res = await fetch(`${HERMES_API_URL}/v1/models`, {
+      headers: hermesAuthHeaders(),
       cache: 'no-store',
       signal: AbortSignal.timeout(8000),
     });

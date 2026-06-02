@@ -34,6 +34,52 @@ hermes-web-ui/
 
 ---
 
+## Part 0 — The Hermes Agent (the backend)
+
+The Vercel UI is only a frontend — it talks to **[Hermes Agent](https://github.com/NousResearch/hermes-agent)**
+(Nous Research), which must run on your Pi and expose its **OpenAI-compatible API
+server** on port **8642**. Without this, the UI just shows *Offline*.
+
+```bash
+# on the Pi (SSH in first)
+pip install hermes-agent     # or the install script from the Hermes repo
+hermes postinstall           # optional: node, browser, ripgrep, ffmpeg
+hermes setup                 # pick an LLM provider (e.g. OpenRouter) + paste its API key
+```
+
+Enable the API server so this UI can reach it. Add to **`~/.hermes/.env`**:
+
+```bash
+API_SERVER_ENABLED=true
+API_SERVER_HOST=0.0.0.0              # MUST be 0.0.0.0, not 127.0.0.1, to be reachable from Vercel
+API_SERVER_PORT=8642
+API_SERVER_KEY=a-long-random-secret  # use this same value as HERMES_API_KEY on Vercel
+```
+
+Start the gateway (keep it running — see the systemd pattern in Part 2, or run it
+under `tmux`/`screen`):
+
+```bash
+hermes gateway
+```
+
+Sanity check on the Pi:
+
+```bash
+curl http://localhost:8642/health
+curl http://localhost:8642/v1/chat/completions \
+  -H "Authorization: Bearer a-long-random-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"hermes-agent","messages":[{"role":"user","content":"hi"}]}'
+```
+
+- The agent's underlying LLM is whatever you chose in `hermes setup` / `hermes model`.
+  In this UI's model search, use what `/v1/models` returns (typically `hermes-agent`).
+- `API_SERVER_KEY` is the agent's auth token → set the **same** value as
+  `HERMES_API_KEY` in Vercel (the UI's proxy sends it as `Authorization: Bearer …`).
+
+---
+
 ## Part 1 — Next.js app (Vercel)
 
 ### Local development
@@ -53,6 +99,7 @@ are **server-side only** — never exposed to the browser.
 | Variable            | Example                      | Purpose                                              |
 | ------------------- | ---------------------------- | ---------------------------------------------------- |
 | `HERMES_API_URL`    | `http://104.229.7.78:8642`   | Hermes Agent's OpenAI-compatible API (chat/models/health) |
+| `HERMES_API_KEY`    | `a-long-random-secret`       | Bearer token for the agent API; must match `API_SERVER_KEY` on the Pi |
 | `HERMES_CONFIG_URL` | `http://104.229.7.78:8643`   | The config server in `/config-server` (runs on the Pi) |
 | `HERMES_CONFIG_KEY` | `a-long-random-secret`       | Shared secret; must match `CONFIG_KEY` on the Pi     |
 
@@ -70,9 +117,10 @@ are **server-side only** — never exposed to the browser.
 
 1. Push this repo to GitHub and **Import Project** in Vercel (root directory = repo
    root; framework auto-detects as Next.js).
-2. In **Project → Settings → Environment Variables**, add the three variables
-   above (`HERMES_API_URL`, `HERMES_CONFIG_URL`, `HERMES_CONFIG_KEY`) for the
-   **Production** (and Preview, if you want) environments.
+2. In **Project → Settings → Environment Variables**, add the four variables
+   above (`HERMES_API_URL`, `HERMES_API_KEY`, `HERMES_CONFIG_URL`,
+   `HERMES_CONFIG_KEY`) for the **Production** (and Preview, if you want)
+   environments.
 3. **Deploy.** After changing any env var later, **redeploy** so the new value
    takes effect.
 
